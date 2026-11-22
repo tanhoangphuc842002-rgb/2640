@@ -267,6 +267,12 @@ details[open] summary{margin-bottom:14px}
 .image-editor{background:#f6f8f4;border:1px solid var(--line);border-radius:9px;padding:16px}
 .image-editor-title{font-size:15px;font-weight:bold;margin-bottom:10px}
 #uploadImageButton{background:var(--red)!important;color:#fff!important}
+.image-transfer{padding:12px;margin:10px 0;border:1px solid var(--line,#d7dde4);border-radius:10px;background:#f9fbfd}
+.image-transfer[data-state="error"]{border-color:#c96565}
+.image-transfer[data-state="done"]{border-color:#6a9b7b}
+.image-transfer progress{display:block;width:100%;height:14px;accent-color:#21704a;margin:8px 0}
+.image-transfer p{margin:0}
+.image-transfer ol{margin:6px 0;padding-inline-start:1.5em;font-size:.85rem;overflow-wrap:anywhere}
 progress{width:100%;accent-color:var(--red);height:8px;margin:12px 0 8px}
 .fuji-presets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .fuji-preset{background:#f6f7f3;border:1px solid var(--line);color:var(--ink);padding:8px;min-width:0}
@@ -827,6 +833,10 @@ async function connect(){
 }
 function disconnect(event) {
   if(event?.target&&event.target!==bleDevice)return;
+  if(imageTransfer&&!imageTransfer.interrupted){
+    imageTransfer.interrupted=true;
+    paintImageTransfer('Mất kết nối. Ảnh chưa tải xong; hãy kết nối và bấm tải lại.',null,'error');
+  }
   window.Flash420?.reset();
   window.AHT48?.reset();
   document.getElementById('deviceProfile').textContent='Chưa kết nối';
@@ -927,7 +937,7 @@ const epdCmd = {
   EPD_CMD_SNV_WRITE:13, EPD_CMD_SNV_READ:14, EPD_CMD_SAVE_CFG:15,
   EPD_CMD_SET_TIME_MODE:16
 };
-async function doCmd(cmd, data) {
+async function doCmd(cmd, data, onWritten) {
   if(window.Flash420?.active()){
     if(cmd==='clr')return Flash420.clear();
     if(cmd==='mode'&&data==='image')return Flash420.imageMode();
@@ -963,6 +973,7 @@ async function doCmd(cmd, data) {
       for (let i=0; i<data.length; i+=60) {
         const chunk = [(i===0?epdCmd.EPD_CMD_BUF:epdCmd.EPD_CMD_BUF_CONT), ...data.slice(i,i+60)];
         await chr.writeValueWithResponse(Uint8Array.from(chunk));
+        onWritten?.(Math.min(i+60,data.length),data.length);
         await sleep(10);
       }
       break;
@@ -1010,15 +1021,17 @@ async function readUc8159UploadAck() {
   return -1;
 }
 
-async function waitUc8159UploadAck(expected, timeoutMs=10000) {
+async function waitUc8159UploadAck(expected, timeoutMs=10000, transfer) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if(transfer)requireImageConnection(transfer);
     const ack = await readUc8159UploadAck();
     if (ack === expected) return;
     await sleep(100);
   }
   /* Recover the previous GUI mode immediately if any upload stage times out.
      The firmware watchdog is a second line of defence if BLE is lost. */
+  if(transfer)requireImageConnection(transfer);
   try {
     if (gattServer && gattServer.connected) {
       info('Dang khoi phuc dong ho/lich sau loi tai anh...');
@@ -1079,21 +1092,79 @@ function canvas2grey8(canvas, type='bw') {
     return arr;
   } catch(e) { return []; }
 }
+let imageTransfer=null;
+function requireImageConnection(transfer){
+  if(transfer.interrupted||gattServer!==transfer.server||!transfer.server.connected)throw Error('Mất kết nối khi tải ảnh.');
+}
+function paintImageTransfer(message, percent, state='active', record=true){
+  const panel=document.getElementById('imageTransferPanel');
+  const progress=document.getElementById('imageUploadProgress');
+  const status=document.getElementById('imageUploadStatus');
+  const log=document.getElementById('imageTransferLog');
+  panel.hidden=false;
+  panel.dataset.state=state;
+  progress.hidden=state==='error';
+  if(percent===null)progress.removeAttribute('value');else progress.value=percent;
+  const line=(!record&&percent!==null?percent+'% · ':'')+message;
+  if(status.textContent!==line)status.textContent=line;
+  if(record){
+    const item=document.createElement('li');
+    item.textContent=formatVietnamTime()+' · '+message;
+    log.append(item);
+    if(log.children.length>12)log.firstElementChild.remove();
+    info(message);
+  }
+}
+function imagePhase(message, percent=null){
+  if(imageTransfer&&!imageTransfer.interrupted){
+    imageTransfer.last=null;
+    paintImageTransfer(message,percent);
+  }
+}
+function imageFraction(sent,total,message='Đang gửi ảnh…'){
+  if(!imageTransfer||imageTransfer.interrupted||total<=0)return;
+  const percent=Math.min(99,Math.floor(100*sent/total));
+  const key=percent+':'+message;
+  if(key===imageTransfer.last)return;
+  imageTransfer.last=key;
+  paintImageTransfer(message,percent,'active',false);
+}
+async function runImageTransfer(work, confirmed=false, propagate=false){
+  if(imageTransfer)return false;
+  const transfer={server:gattServer,interrupted:false,last:null};
+  imageTransfer=transfer;
+  document.getElementById('imageTransferLog').replaceChildren();
+  imagePhase('Bắt đầu tải ảnh…');
+  try{
+    if(!transfer.server?.connected)throw Error('Chưa kết nối với thiết bị.');
+    await work(transfer);
+    requireImageConnection(transfer);
+    paintImageTransfer(confirmed?'Tải ảnh hoàn tất.':'Đã gửi ảnh. Kiểm tra kết quả trên màn hình đồng hồ.',100,'done');
+    return true;
+  }catch(e){
+    if(!transfer.interrupted)paintImageTransfer('Tải ảnh chưa xong: '+(e?.message||'Không nhận được phản hồi.'),null,'error');
+    if(propagate)throw e;
+    return false;
+  }finally{
+    imageTransfer=null;
+  }
+}
 let step=0;
-async function doUploadImageGray8() {
+async function doUploadImageGray8(cmd) {
   try {
-    await doCmd('clr'); await sleep(15000);
+    await cmd('clr'); await sleep(15000);
     doImageGrey();
     for (step=0; step<8; step++) {
-      await doCmd('rst'); await sleep(8000);
-      await doUploadImageRam8('bw');
-      await doUploadImageRam8('red');
-      await doCmd('dp', 'gray8'); await sleep(8000);
+      imagePhase('Đang xử lý lớp thang xám '+(step+1)+'/8…',Math.floor(step*100/8));
+      await cmd('rst'); await sleep(8000);
+      await doUploadImageRam8(cmd,'bw');
+      await doUploadImageRam8(cmd,'red');
+      await cmd('dp', 'gray8'); await sleep(8000);
     }
     step=0; info('> Đã tải ảnh thang xám');
   } catch(e) { info(`Tải ảnh thang xám thất bại: ${e.message}`); throw e; }
 }
-async function doUploadImageRam8(type='bw') {
+async function doUploadImageRam8(cmd,type='bw') {
   const ram = type==='bw'?ram_bw:ram_red;
   if (!ram || ram.length===0) { info(`Không có dữ liệu thang xám ${type}`); throw new Error("Không có dữ liệu thang xám"); }
   const arr = []; let buffer=[];
@@ -1105,10 +1176,11 @@ async function doUploadImageRam8(type='bw') {
     }
   }
   info(`> write ${type} ram: ${arr.length} bytes`);
-  await doCmd('buf', arr);
-  await doCmd(type);
+  const plane=step*2+(type==='red'?1:0);
+  await cmd('buf',arr,(sent,total)=>imageFraction(plane+sent/total,16,'Đang gửi lớp thang xám '+(step+1)+'/8…'));
+  await cmd(type);
 }
-async function doUploadImageRam2(type='bw') {
+async function doUploadImageRam2(cmd,type='bw') {
   const canvas = document.getElementById('canvas');
   if (!canvas || canvas.width===0 || canvas.height===0) {
     info("Khung vẽ chưa được khởi tạo");
@@ -1124,15 +1196,18 @@ async function doUploadImageRam2(type='bw') {
   let convertType='ssd';
   for (const r of radios) { if (r.checked) { convertType=r.value; break; } }
   const screenSize = document.getElementById('screensize')?.value || '';
+  const plane=type==='red'?1:0;
+  const label=type==='red'?'màu đỏ':'đen trắng';
   if (screenSize === '400*300' || screenSize === '300*400') {
     let total = 0;
-    for (let page=0; page<Math.ceil(SSD1619_UPLOAD_H / SSD1619_PAGE_H); page++) {
+    const pageCount=Math.ceil(SSD1619_UPLOAD_H / SSD1619_PAGE_H);
+    for (let page=0; page<pageCount; page++) {
       const pageArr = canvas2bytesSsd1619Page(canvas, type, page);
       if (!pageArr || pageArr.length===0) continue;
       total += pageArr.length;
       info(`Đã tạo dữ liệu ${type} page ${page}: ${pageArr.length} byte`);
-      await doCmd('buf', pageArr);
-      await doCmd(type, page);
+      await cmd('buf',pageArr,(sent,size)=>imageFraction(plane*pageCount+page+sent/size,2*pageCount,'Đang gửi '+label+' · trang '+(page+1)+'/'+pageCount+'…'));
+      await cmd(type, page);
       await sleep(1500);
     }
     if (total === 0) {
@@ -1147,12 +1222,12 @@ async function doUploadImageRam2(type='bw') {
     throw new Error("Không có dữ liệu byte được tạo");
   }
   info(`Đã tạo dữ liệu ${type}: ${arr.length} byte`);
-  await doCmd('buf', arr);
-  await doCmd(type);
+  await cmd('buf',arr,(sent,total)=>imageFraction(plane+sent/total,2,'Đang gửi '+label+'…'));
+  await cmd(type);
   return arr;
 }
 
-async function doUploadImageUc8159() {
+async function doUploadImageUc8159(cmd,transfer) {
   const canvas = document.getElementById('canvas');
   if (!canvas || canvas.width === 0 || canvas.height === 0) {
     throw new Error('Khung vẽ chưa sẵn sàng');
@@ -1163,56 +1238,57 @@ async function doUploadImageUc8159() {
       throw new Error(`Trang ảnh ${page + 1} có kích thước sai (${data.length} byte)`);
     }
     info(`Đã tạo dữ liệu ảnh UC8159 trang ${page + 1}/${UC8159_PAGE_COUNT}: ${data.length} byte`);
-    await doCmd('buf', data);
-    await doCmd('bw', page);
+    await cmd('buf',data,(sent,total)=>imageFraction(page+sent/total,UC8159_PAGE_COUNT,'Đang gửi trang '+(page+1)+'/'+UC8159_PAGE_COUNT+'…'));
+    await cmd('bw', page);
     /* Firmware confirms that SPI consumed this page before reusing buffer. */
-    await waitUc8159UploadAck(page + 1, 30000);
+    await waitUc8159UploadAck(page + 1, 30000,transfer);
   }
 }
 
 async function doUploadImage(type='full') {
   if(window.Flash420?.active())return Flash420.upload();
-  try {
-    info("Bắt đầu tải lên...");
-    if (!epdService || !gattServer || !gattServer.connected) {
-      throw new Error('Chưa kết nối. Hãy bấm Kết nối; web không tự nối lại.');
-    }
-    const screenSize = document.getElementById('screensize')?.value || '';
-    const isUc8159_7in5 = screenSize === '640*384';
+  const isUc8159_7in5=document.getElementById('screensize')?.value==='640*384';
+  return runImageTransfer(async transfer=>{
+    setEpdBusy(true);
+    const cmd=(...args)=>{
+      requireImageConnection(transfer);
+      return doCmd(...args);
+    };
+    try{
     /*
      * Stop the clock/calendar periodic redraw before sending the paged image.
      * V81 clears and sleeps the display while entering image mode, so wait for
      * that operation to finish before RST starts the BW/RED page stream.
      * V33 and newer do not need the long delay, but remain compatible with it.
     */
-    await doCmd('mode', 'image');
-    info("Đang đợi firmware hoàn tất chuyển sang chế độ ảnh...");
+    imagePhase('Đang chuyển thiết bị sang chế độ ảnh…');
+    await cmd('mode', 'image');
     if (isUc8159_7in5) {
-      await waitUc8159UploadAck(0xff, 60000);
+      await waitUc8159UploadAck(0xff, 60000,transfer);
     } else {
       await sleep(15000);
     }
     if (isUc8159_7in5) {
-      await doCmd('rst');
+      await cmd('rst');
       /* A cold UC8159/panel start can take well over ten seconds. */
-      await waitUc8159UploadAck(0, 60000);
-      await doUploadImageUc8159();
-      await doCmd('dp', 'full');
-      await waitUc8159UploadAck(0xfe, 90000);
+      await waitUc8159UploadAck(0, 60000,transfer);
+      await doUploadImageUc8159(cmd,transfer);
+      imagePhase('Đã gửi dữ liệu. Đang chờ màn hình làm mới…',99);
+      await cmd('dp', 'full');
+      await waitUc8159UploadAck(0xfe, 90000,transfer);
     } else if (type==='gray8') {
-      await doUploadImageGray8();
+      await doUploadImageGray8(cmd);
     } else {
-      await doCmd('rst'); await sleep(2000);
-      await doUploadImageRam2('bw');
-      await doUploadImageRam2('red');
-      await doCmd('dp', 'full'); await sleep(15000);
+      await cmd('rst'); await sleep(2000);
+      await doUploadImageRam2(cmd,'bw');
+      await doUploadImageRam2(cmd,'red');
+      imagePhase('Đã gửi dữ liệu. Đang chờ màn hình làm mới…',99);
+      await cmd('dp', 'full'); await sleep(15000);
     }
-    info("Đã truyền xong ảnh");
-  } catch(e) {
-    console.error("Tải lên thất bại: ", e);
-    info(`Tải lên thất bại: ${e.message}`);
-    throw e;
-  }
+    }finally{
+      if(gattServer===transfer.server)etagFnEnable(!!transfer.server.connected);
+    }
+  },isUc8159_7in5);
 }
 function info(logTXT) {
   const time = formatVietnamTime();
@@ -1563,7 +1639,12 @@ function convert_dithering() {
         <div class="btn-group">
           <button id="uploadImageButton" onclick="doUploadImage(&#39;full&#39;)" style="background-color: #34c759; color: white; border: none;" disabled="true">Xác nhận tải lên</button>
         </div>
-        <progress id="imageUploadProgress" value="0" max="100" aria-label="Tiến độ tải ảnh"></progress><p id="imageUploadStatus" role="status" aria-live="polite"></p>
+        <div class="image-transfer" id="imageTransferPanel" hidden>
+          <strong>Tiến độ tải ảnh</strong>
+          <progress id="imageUploadProgress" max="100" aria-label="Tiến độ tải ảnh"></progress>
+          <p id="imageUploadStatus" role="status" aria-live="polite"></p>
+          <details open><summary>Nhật ký tải ảnh</summary><ol id="imageTransferLog"></ol></details>
+        </div>
       </div>
     </div>
 
@@ -1628,7 +1709,7 @@ const bytes=Uint8Array.from(atob(Font420Bundle.bytes),c=>c.charCodeAt(0));
 function requiredExtra(){return detectedVersion===109?Font420Features.bold109:Font420Features;}
 const errors=['','Đồng hồ hoặc dữ liệu chưa sẵn sàng.','Chưa ghi được bộ nhớ. Hãy kiểm tra pin và kết nối.','Gói truyền chưa đúng thứ tự. Bấm Cài đặt để thử lại.','Chưa kiểm tra được dữ liệu. Bấm Cài đặt để thử lại.','Lệnh chưa hợp lệ.'];
 function log(t){window.info(t);}
-function status(t){$('status').textContent=t;const el=document.getElementById('imageUploadStatus');if(el)el.textContent=t;log(t);}
+function status(t){$('status').textContent=t;log(t);}
 function controls(){
  const ok=!!gatt?.connected&&!!cap;
  window.setEpdBusy?.(busy);
@@ -1833,17 +1914,19 @@ async function uploadImage(){
   pages.push({type,page,data});
  }
  try{
+  imagePhase('Đang chuyển thiết bị sang chế độ ảnh…');
   await imageMode();await imageCommand(6,undefined,5000);
   for(let n=0;n<pages.length;n++){
    const {type,page,data}=pages[n];
    for(let at=0;at<data.length;at+=19){
     if(token!==session)throw Error('Phiên kết nối đã đổi.');
     await raw(Uint8Array.from([at?4:3,...data.slice(at,at+19)]));
+    imageFraction(n+Math.min(at+19,data.length)/data.length,pages.length,'Đang gửi trang '+(n+1)+'/'+pages.length+'…');
    }
    await imageCommand(type==='bw'?7:8,page);
-   $('progress').value=Math.round((n+1)*100/pages.length);document.getElementById('imageUploadProgress').value=$('progress').value;
    status('Đã ghi trang '+(n+1)+'/8 · '+(type==='bw'?'đen trắng':'đỏ')+' · '+data.length+' byte');
   }
+  imagePhase('Đã gửi dữ liệu. Đang chờ màn hình làm mới…',99);
   await imageCommand(9,0,20000);
   status('Đã truyền và làm mới ảnh 4.2. Ảnh được giữ nguyên đến khi chọn lại đồng hồ/lịch.');
  }catch(e){
@@ -1863,7 +1946,8 @@ async function storeObject(id,data){
    if(token!==session)throw Error('Phiên kết nối đã thay đổi.');
    const part=data.slice(at,at+cap.chunk),reply=await request(33,Uint8Array.from([...u32(at),...part]),id===3);at+=part.length;
    if(value32(reply,5)!==at)throw Error('Chưa xác nhận đủ dữ liệu mới.');
-   $('progress').value=Math.round(at/data.length*100);document.getElementById('imageUploadProgress').value=$('progress').value;
+   if(id===0||id===1)imageFraction(at,data.length,'Đang lưu ảnh nền…');
+   else $('progress').value=Math.round(at/data.length*100);
   }
   await request(34);await info();
  }catch(e){if(token===session&&gatt?.connected)await request(4).catch(()=>{});throw e;}
@@ -1949,8 +2033,10 @@ async function uploadPicture(){
  if(!cap?.ready||cap.crc!==Font420Bundle.crc32)throw Error('Cài / kiểm tra tài nguyên trước khi thay ảnh nền.');
  const target=document.getElementById('imageTarget').value,id=target==='scene4'?0:target==='scene3'?1:-1;
  if(id<0)throw Error('Chọn một mặt đồng hồ tranh để thay ảnh nền.');
- status('Đang lưu ảnh nền riêng; không ghi đè bộ chữ hoặc ngày lễ.');
- await storeObject(id,pictureBytes());await sync(id===0?7:9);status('Đã thay ảnh nền và mở mặt đồng hồ tương ứng.');
+ imagePhase('Đang chuẩn bị ảnh nền…');
+ await storeObject(id,pictureBytes());
+ imagePhase('Đã lưu ảnh nền. Đang chờ mở mặt đồng hồ…',99);
+ await sync(id===0?7:9);status('Đã thay ảnh nền và mở mặt đồng hồ tương ứng.');
 }
 document.getElementById('restorePicture').onclick=()=>action(async()=>{
  const target=document.getElementById('imageTarget').value,id=target==='scene4'?0:target==='scene3'?1:-1;
@@ -1962,7 +2048,8 @@ window.Flash420={
  canPicture:()=>detectedVersion>=105&&!!gatt?.connected&&!busy&&!!cap?.ready&&cap.crc===Font420Bundle.crc32,
  attach,reset:disconnected,controls,active:()=>detectedVersion!==0,
  select:mode=>action(()=>sync(mode)),sync:()=>action(()=>sync(currentMode||1)),
- imageMode:()=>action(imageMode),upload:()=>action(()=>document.getElementById('imageTarget').value==='full'?uploadImage():uploadPicture()),
+ imageMode:()=>action(imageMode),upload:()=>action(()=>runImageTransfer(
+  document.getElementById('imageTarget').value==='full'?uploadImage:uploadPicture,detectedVersion>=104,true)),
  clear:()=>action(async()=>{await imageMode();await imageCommand(1,undefined,20000);status('Đã xóa trắng màn4.2.');}),
  fill:color=>action(async()=>{
   const canvas=document.getElementById('canvas');canvas.width=400;canvas.height=300;
@@ -2097,7 +2184,7 @@ document.body.onload = () => {
     }
   });
   document.querySelectorAll('#goog-gt-tt, .skiptranslate').forEach(element => element.remove());
-  document.getElementById('log').innerHTML = `${formatVietnamTime()} : Web V50 — thêm kênh cài tài nguyên nhanh cho Flash 4.2 V109R5; giữ AHT30, các thiết bị cũ và không tự kết nối lại.<br>`;
+  document.getElementById('log').innerHTML = `${formatVietnamTime()} : Web V51 — tiến độ và nhật ký tải ảnh; giữ kênh cài tài nguyên của V50. Không tự kết nối lại.<br>`;
   const canvas = document.getElementById('canvas');
   const ctx = canvas.getContext('2d');
   ctx.fillStyle='white'; ctx.fillRect(0,0,canvas.width,canvas.height);
@@ -2289,7 +2376,7 @@ function refresh(){if(!initialized)return;const s=snapshot(),key=s.kind+':'+s.ve
    else{const c=$('canvas');c.width=400;c.height=300;const ctx=c.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,400,300);}
   }
  }
- if(!s.connected&&lastConnection){showTab('faces');}lastConnection=s.connected?s.name:'';
+ if(!s.connected&&lastConnection&&!(activeTab==='images'&&$('imageTransferPanel').dataset.state==='error')){showTab('faces');}lastConnection=s.connected?s.name:'';
  $('library-device-name').textContent=s.name;
  $('library-connection').textContent=linking||connecting?'Đang xử lý kết nối…':s.connected?'Đã kết nối':'Chưa kết nối';
  $('library-connection').classList.toggle('connected',s.connected);
@@ -2317,7 +2404,7 @@ function refresh(){if(!initialized)return;const s=snapshot(),key=s.kind+':'+s.ve
  $('library-selection').textContent=chosen?chosen[1]:'Chọn một mặt ở trên';
  $('library-selection-help').textContent=!s.connected?'Ảnh chỉ để xem trước. Kết nối thiết bị để sử dụng.':s.busy?'Đang chờ thiết bị xử lý. Không chuyển mặt hoặc tải ảnh lúc này.':!chosen?'Chạm vào ảnh để chọn, chưa gửi lệnh tới thiết bị.':!s.ready&&s.kind!=='legacy'?'Cài tài nguyên trong Thiết lập trước khi sử dụng.':'Bấm “Áp dụng” để gửi yêu cầu chuyển mặt.';
  $('library-apply').disabled=!s.connected||s.busy||!chosen||(s.kind!=='legacy'&&!s.ready)||!!source?.disabled;
- $('library-technical').textContent='Web V50 · '+(s.connected?(s.kind==='sensor'?'AHT30 V'+s.version:s.kind==='flash'?'Flash 4.2 · giao thức '+s.version:'Giao thức tương thích cũ'):'Chưa nhận diện firmware')+' · Không tự kết nối lại';
+ $('library-technical').textContent='Web V51 · '+(s.connected?(s.kind==='sensor'?'AHT30 V'+s.version:s.kind==='flash'?'Flash 4.2 · giao thức '+s.version:'Giao thức tương thích cũ'):'Chưa nhận diện firmware')+' · Không tự kết nối lại';
 }
 function schedule(){if(scheduled)return;scheduled=true;queueMicrotask(()=>{scheduled=false;refresh();});}
 async function apply(){const s=snapshot(),f=s.faces.find(f=>f[0]===selected);if($('library-apply').disabled||!f)return;
