@@ -1620,7 +1620,7 @@ window.FujiGallery={select,controls};controls(false,false);
 </script><script>
 (function(){
 'use strict';
-const $=id=>document.getElementById('flash420-'+id);let detectedVersion=0,extraReady=false;
+const $=id=>document.getElementById('flash420-'+id);let detectedVersion=0,extraReady=false,fastResourcesDisabled=false;
 let displayPending=null;
 let connectionStage='chưa bắt đầu';
 let device,gatt,ch,pending,seq=0,busy=false,cap=null,session=0,currentMode=null,firmware=0,actionId=0;
@@ -1649,24 +1649,27 @@ function u32(n){const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,n,t
 function value32(b,at){return new DataView(b.buffer,b.byteOffset,b.byteLength).getUint32(at,true);}
 function notice(event){if(event.target!==ch)return;const b=new Uint8Array(event.target.value.buffer,event.target.value.byteOffset,event.target.value.byteLength);const text=new TextDecoder().decode(b);if(text==='ink=ok'||text==='ink=timeout'){log(text==='ink=ok'?(firmware===0xad?'Đã dọn nền trắng toàn màn và tô lại đen/đỏ.':'Đã tô lại đen và đỏ, không dọn nền trắng.'):'Tô lại màu chưa hoàn tất; đồng hồ sẽ thử phục hồi ở phút tiếp theo.');return;}if(text==='partial=0'||text==='partial=1'){log(text==='partial=0'?'Đã chọn cập nhật một lượt như v1.2.':'Đã chọn thử xóa nét cũ.');return;}if(text==='display=ok'){if(displayPending)displayPending.finish();log('Đồng hồ đã hoàn tất làm mới màn hình.');return;}if(text==='display=timeout'){if(displayPending)displayPending.finish(Error('Màn hình chưa phản hồi đúng hạn. Đồng hồ sẽ thử lại ở phút tiếp theo; có thể bấm Đồng bộ giờ để thử ngay.'));status('Màn hình chưa phản hồi đúng hạn. Đồng hồ sẽ thử lại ở phút tiếp theo; bấm Đồng bộ giờ để thử ngay.');return;}if(b.length>=5&&b[0]===0xe8&&b[1]===0x42){if(pending&&b[2]===pending.op&&b[3]===pending.seq){const p=pending;p.reply=b.slice();p.complete();}return;}}
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
-async function exchange(kind,op,payload=new Uint8Array()){
+const canFastResources=()=>detectedVersion===109&&!fastResourcesDisabled&&!!ch?.properties?.writeWithoutResponse&&typeof ch.writeValueWithoutResponse==='function';
+async function exchange(kind,op,payload=new Uint8Array(),resource=false){
  if(!gatt?.connected||!ch)throw Error('Đã mất kết nối.');
  if(pending)throw Error('Đang chờ đồng hồ xử lý.');
  const packet=Uint8Array.from([kind,0x42,op,++seq&255,...payload]),token=session;
  const block=kind===0xe8&&(op===2||op===18||op===33)&&packet.length>20;
+ const fast=resource&&block&&(op===2||op===33)&&canFastResources();
  if(packet.length>20&&(!block||packet.length>188))throw Error('Lệnh quá dài.');
  const job={finish(){pending=null;}};pending=job;
  try{
-  /* V36-compatible write path. TI characteristic advertises WRITE (response),
-   * not WRITE_NO_RESPONSE. Select the method once; never resend on error. */
-  const write=p=>ch.writeValue?ch.writeValue(p):ch.writeValueWithResponse(p);
+  /* Only resource fragments opt in. Do not change image, event, or legacy writes. */
+  const write=p=>detectedVersion===109&&ch.properties?.writeWithoutResponse&&typeof ch.writeValueWithResponse==='function'?ch.writeValueWithResponse(p):ch.writeValue?ch.writeValue(p):ch.writeValueWithResponse(p);
   if(block){
    for(let at=0;at<packet.length;at+=14){
     if(token!==session||!gatt?.connected)throw Error('Đã ngắt kết nối.');
-    await write(Uint8Array.from([0xe9,0x42,5,packet[3],at,packet.length,...packet.slice(at,at+14)]));
+    const fragment=Uint8Array.from([0xe9,0x42,5,packet[3],at,packet.length,...packet.slice(at,at+14)]);
+    if(fast){await ch.writeValueWithoutResponse(fragment);if(at===70||at===154)await pause(8);}
+    else await write(fragment);
    }
   }else await write(packet);
-  const end=Date.now()+45000;
+  const end=Date.now()+(fast?12000:45000);
   while(Date.now()<end){
    if(token!==session||!gatt?.connected)throw Error('Đã ngắt kết nối.');
    try{
@@ -1679,19 +1682,22 @@ async function exchange(kind,op,payload=new Uint8Array()){
    await pause(4);
   }
   throw Error('Chưa nhận được xác nhận. Kết nối lại để thử tiếp.');
+ }catch(e){
+  if(fast&&token===session&&gatt?.connected){fastResourcesDisabled=true;throw Error('Gửi nhanh chưa hoàn tất. Bấm Cài tài nguyên lần nữa để dùng đường gửi có xác nhận. '+e.message);}
+  throw e;
  }finally{if(pending===job)pending=null;}
 }
-async function request(op,payload=new Uint8Array()){
+async function request(op,payload=new Uint8Array(),resource=false){
  if(op===5&&payload.length>16){
   if(payload.length>111)throw Error('Tối đa 111 byte UTF-8.');
   let reply;
   for(let at=0;at<payload.length;at+=14)reply=await exchange(0xe9,4,Uint8Array.from([at,payload.length,...payload.slice(at,at+14)]));
   return reply;
  }
- return exchange(0xe8,op,payload);
+ return exchange(0xe8,op,payload,resource);
 }
 function disconnected(){
- session++;actionId++;gatt=ch=cap=null;busy=false;pending=null;detectedVersion=0;currentMode=null;extraReady=false;
+ session++;actionId++;gatt=ch=cap=null;busy=false;pending=null;detectedVersion=0;currentMode=null;extraReady=false;fastResourcesDisabled=false;
  document.getElementById('flash420-panel').hidden=true;controls();
 }
 async function info(){const b=await request(0);if(b.length!==20)throw Error('Phản hồi nhận diện chưa hợp lệ.');cap={present:!!b[5],ready:!!b[6],id:Array.from(b.slice(7,10)),size:b[10]|b[11]<<8,crc:value32(b,12),voltage:(b[16]|b[17]<<8)/1000,safe:!!b[18],chunk:Math.max(1,Math.min(180,b[19]))};if(detectedVersion>=105){const m=await request(35,Uint8Array.of(3)),extra=requiredExtra();extraReady=value32(m,6)===extra.auxLength&&value32(m,10)===extra.auxCrc;}else extraReady=true;$('state').textContent=(device?.name||'Đồng hồ')+' · Pin '+cap.voltage.toFixed(2)+' V · Flash '+cap.id.map(n=>n.toString(16).padStart(2,'0').toUpperCase()).join(' ')+' · '+(cap.ready?'Đã có dữ liệu':'Chưa cài dữ liệu');return cap;}
@@ -1700,10 +1706,10 @@ $('check').onclick=()=>action(async()=>{await info();status(cap.ready?'Dữ li�
 async function install(){
  await request(4);const c=await info(),token=session;if(!c.safe)throw Error('Cấu hình chân đang trùng với flash. Chưa ghi/xóa dữ liệu.');if(!c.present)throw Error('Chưa đọc ổn định được Flash 512 KiB. Chưa ghi/xóa dữ liệu.');
  if(c.ready&&c.size===bytes.length&&c.crc===Font420Bundle.crc32){$('progress').value=100;await installExtra();status('Bộ chữ và dữ liệu đã sẵn sàng.');return;}
- status('Đang cài bộ chữ và dữ liệu ngày lễ. Không ngắt kết nối.');$('progress').value=0;await request(1,new Uint8Array([...u32(bytes.length),...u32(Font420Bundle.crc32)]));
+ status('Đang cài bộ chữ và dữ liệu ngày lễ '+(canFastResources()?'qua kênh nhanh':'qua kênh có xác nhận')+'. Không ngắt kết nối.');$('progress').value=0;await request(1,new Uint8Array([...u32(bytes.length),...u32(Font420Bundle.crc32)]));
  const started=Date.now();
  try{
-  let last=0;for(let at=0;at<bytes.length;){if(token!==session)throw Error('Kết nối đã đổi.');const part=bytes.slice(at,at+c.chunk),r=await request(2,new Uint8Array([...u32(at),...part]));at+=part.length;if(value32(r,5)!==at)throw Error('Chưa xác nhận đủ dữ liệu.');const pc=Math.floor(at/bytes.length*100);$('progress').value=pc;if(pc-last>=10){last=pc;const seconds=Math.max(1,(Date.now()-started)/1000);log('Đã truyền '+pc+'% · '+Math.round(at/seconds)+' byte/s.');}}
+  let last=0;for(let at=0;at<bytes.length;){if(token!==session)throw Error('Kết nối đã đổi.');const part=bytes.slice(at,at+c.chunk),r=await request(2,new Uint8Array([...u32(at),...part]),true);at+=part.length;if(value32(r,5)!==at)throw Error('Chưa xác nhận đủ dữ liệu.');const pc=Math.floor(at/bytes.length*100);$('progress').value=pc;if(pc-last>=10){last=pc;const seconds=Math.max(1,(Date.now()-started)/1000);log('Đã truyền '+pc+'% · '+Math.round(at/seconds)+' byte/s.');}}
   status('Đang kiểm tra và hoàn tất…');await request(3);await info();if(!cap.ready||cap.crc!==Font420Bundle.crc32)throw Error('Chưa xác nhận được bộ cài.');currentMode=3;await installExtra();status('Cài đặt hoàn tất trong '+Math.round((Date.now()-started)/1000)+' giây. Có thể chọn giao diện.');
  }catch(e){
   if(token===session&&gatt?.connected)await request(4).catch(()=>{});
@@ -1855,7 +1861,7 @@ async function storeObject(id,data){
  try{
   for(let at=0;at<data.length;){
    if(token!==session)throw Error('Phiên kết nối đã thay đổi.');
-   const part=data.slice(at,at+cap.chunk),reply=await request(33,Uint8Array.from([...u32(at),...part]));at+=part.length;
+   const part=data.slice(at,at+cap.chunk),reply=await request(33,Uint8Array.from([...u32(at),...part]),id===3);at+=part.length;
    if(value32(reply,5)!==at)throw Error('Chưa xác nhận đủ dữ liệu mới.');
    $('progress').value=Math.round(at/data.length*100);document.getElementById('imageUploadProgress').value=$('progress').value;
   }
@@ -2091,7 +2097,7 @@ document.body.onload = () => {
     }
   });
   document.querySelectorAll('#goog-gt-tt, .skiptranslate').forEach(element => element.remove());
-  document.getElementById('log').innerHTML = `${formatVietnamTime()} : Web V49 — thêm Đếm ngược AHT30 V55, Giờ lớn dùng mẫu tối giản; giữ thiết bị cũ và không tự kết nối lại.<br>`;
+  document.getElementById('log').innerHTML = `${formatVietnamTime()} : Web V50 — thêm kênh cài tài nguyên nhanh cho Flash 4.2 V109R5; giữ AHT30, các thiết bị cũ và không tự kết nối lại.<br>`;
   const canvas = document.getElementById('canvas');
   const ctx = canvas.getContext('2d');
   ctx.fillStyle='white'; ctx.fillRect(0,0,canvas.width,canvas.height);
@@ -2311,7 +2317,7 @@ function refresh(){if(!initialized)return;const s=snapshot(),key=s.kind+':'+s.ve
  $('library-selection').textContent=chosen?chosen[1]:'Chọn một mặt ở trên';
  $('library-selection-help').textContent=!s.connected?'Ảnh chỉ để xem trước. Kết nối thiết bị để sử dụng.':s.busy?'Đang chờ thiết bị xử lý. Không chuyển mặt hoặc tải ảnh lúc này.':!chosen?'Chạm vào ảnh để chọn, chưa gửi lệnh tới thiết bị.':!s.ready&&s.kind!=='legacy'?'Cài tài nguyên trong Thiết lập trước khi sử dụng.':'Bấm “Áp dụng” để gửi yêu cầu chuyển mặt.';
  $('library-apply').disabled=!s.connected||s.busy||!chosen||(s.kind!=='legacy'&&!s.ready)||!!source?.disabled;
- $('library-technical').textContent='Web V49 · '+(s.connected?(s.kind==='sensor'?'AHT30 V'+s.version:s.kind==='flash'?'Flash 4.2 · giao thức '+s.version:'Giao thức tương thích cũ'):'Chưa nhận diện firmware')+' · Không tự kết nối lại';
+ $('library-technical').textContent='Web V50 · '+(s.connected?(s.kind==='sensor'?'AHT30 V'+s.version:s.kind==='flash'?'Flash 4.2 · giao thức '+s.version:'Giao thức tương thích cũ'):'Chưa nhận diện firmware')+' · Không tự kết nối lại';
 }
 function schedule(){if(scheduled)return;scheduled=true;queueMicrotask(()=>{scheduled=false;refresh();});}
 async function apply(){const s=snapshot(),f=s.faces.find(f=>f[0]===selected);if($('library-apply').disabled||!f)return;
