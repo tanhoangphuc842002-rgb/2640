@@ -249,6 +249,11 @@ label{overflow-wrap:anywhere}
 .apply-bar strong{font-size:14px}
 .apply-bar button{flex-shrink:0;min-width:150px}
 .library-notice{font-size:13px;min-height:22px;color:var(--green);margin-top:14px;overflow-wrap:anywhere}
+.library-notice[data-state="error"]{color:#a3282d}
+.face-switch-track{position:relative;height:8px;margin-top:12px;border-radius:99px;background:#dfebe2;overflow:hidden}
+.face-switch-track::before{content:"";position:absolute;inset:0 auto 0 0;width:34%;border-radius:inherit;background:#28714c;animation:face-switch-motion 1.25s ease-in-out infinite}
+@keyframes face-switch-motion{from{transform:translateX(-105%)}to{transform:translateX(300%)}}
+@media(prefers-reduced-motion:reduce){.face-switch-track::before{animation:none;transform:translateX(97%)}}
 .library-help{display:flex;gap:9px;margin:16px 0 0;padding:12px 14px;background:#f4f6f1;border-radius:9px;font-size:13px;color:var(--sub)}
 .library-footer{text-align:center;color:var(--sub);font-size:12px;margin-top:22px}
 .backend-only{display:none!important}
@@ -1782,7 +1787,7 @@ function disconnected(){
  document.getElementById('flash420-panel').hidden=true;controls();
 }
 async function info(){const b=await request(0);if(b.length!==20)throw Error('Phản hồi nhận diện chưa hợp lệ.');cap={present:!!b[5],ready:!!b[6],id:Array.from(b.slice(7,10)),size:b[10]|b[11]<<8,crc:value32(b,12),voltage:(b[16]|b[17]<<8)/1000,safe:!!b[18],chunk:Math.max(1,Math.min(180,b[19]))};if(detectedVersion>=105){const m=await request(35,Uint8Array.of(3)),extra=requiredExtra();extraReady=value32(m,6)===extra.auxLength&&value32(m,10)===extra.auxCrc;}else extraReady=true;$('state').textContent=(device?.name||'Đồng hồ')+' · Pin '+cap.voltage.toFixed(2)+' V · Flash '+cap.id.map(n=>n.toString(16).padStart(2,'0').toUpperCase()).join(' ')+' · '+(cap.ready?'Đã có dữ liệu':'Chưa cài dữ liệu');return cap;}
-async function action(fn){if(busy)return;const id=++actionId;busy=true;controls();try{await fn();}catch(e){if(id===actionId&&!e.connectionReported)status('Chưa hoàn tất: '+e.message);}finally{if(id===actionId){busy=false;controls();}}}
+async function action(fn){if(busy)return false;const id=++actionId;busy=true;controls();try{await fn();return id===actionId;}catch(e){if(id===actionId&&!e.connectionReported)status('Chưa hoàn tất: '+e.message);return false;}finally{if(id===actionId){busy=false;controls();}}}
 $('check').onclick=()=>action(async()=>{await info();status(cap.ready?'Dữ liệu đã được kiểm tra khi khởi động và sẵn sàng sử dụng.':'Chưa có bộ dữ liệu hợp lệ. Bấm Cài đặt để cài.');});
 async function install(){
  await request(4);const c=await info(),token=session;if(!c.safe)throw Error('Cấu hình chân đang trùng với flash. Chưa ghi/xóa dữ liệu.');if(!c.present)throw Error('Chưa đọc ổn định được Flash 512 KiB. Chưa ghi/xóa dữ liệu.');
@@ -1804,6 +1809,7 @@ async function sync(mode=currentMode){
  await exchange(0xe9,1,Uint8Array.from([...u32(Math.floor(Date.now()/1000)),mode]));
  log('Firmware đã nhận và áp dụng lệnh chọn mặt '+mode+' sau '+((Date.now()-started)/1000).toFixed(1)+' giây. Đang vẽ màn hình…');
  currentMode=mode;
+ window.EpdLibrary?.onFaceDraw(gatt);
  const end=Date.now()+120000;
  while(Date.now()<end){await pause(250);const b=await exchange(0xe9,3);if(b[5]===0){log('Đã vẽ xong mặt '+mode+'; tổng '+((Date.now()-started)/1000).toFixed(1)+' giây từ khi gửi lệnh.');return;}if(b[5]===2)throw Error('Màn hình BUSY quá hạn; phút sau sẽ thử full lại.');}
  throw Error('Chưa hoàn tất vẽ màn hình.');
@@ -2184,7 +2190,7 @@ document.body.onload = () => {
     }
   });
   document.querySelectorAll('#goog-gt-tt, .skiptranslate').forEach(element => element.remove());
-  document.getElementById('log').innerHTML = `${formatVietnamTime()} : Web V51 — tiến độ và nhật ký tải ảnh; giữ kênh cài tài nguyên của V50. Không tự kết nối lại.<br>`;
+  document.getElementById('log').innerHTML = `${formatVietnamTime()} : Web V52 — thêm thanh chờ chuyển mặt; giữ tiến độ tải ảnh và kênh cài tài nguyên. Không tự kết nối lại.<br>`;
   const canvas = document.getElementById('canvas');
   const ctx = canvas.getContext('2d');
   ctx.fillStyle='white'; ctx.fillRect(0,0,canvas.width,canvas.height);
@@ -2330,14 +2336,15 @@ const flash=[
  ['f8','Lịch · việc cần làm','Lịch tháng và hai việc cần nhớ','flash8',100,'flash420-common']
 ];
 const legacy=[['clock','Đồng hồ 1','Bố cục theo firmware của thiết bị','',0],['clock2','Đồng hồ 2','Bố cục theo firmware của thiết bị','',0],['calendar','Lịch tháng','Bố cục theo firmware của thiết bị','',0]];
-let initialized=false,scheduled=false,selected=null,profileKey='',renderKey='',applying=false,connecting=false,activeTab='faces',lastConnection='';
+let initialized=false,scheduled=false,selected=null,profileKey='',renderKey='',faceSwitch=null,connecting=false,activeTab='faces',lastConnection='';
+const NO_DRAW_STATUS_WAIT_MS=12000;
 const node=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n;};
 function heading(title,description){const h=node('div','panel-heading'),a=node('div');a.append(node('h2','',title),node('p','',description));h.append(a);return h;}
 function snapshot(){const connected=!!gattServer?.connected,a=window.AHT48?.uiState(),f=window.Flash420?.uiState();
  const kind=connected?(a?.active?'sensor':f?.active?'flash':'legacy'):'preview';
  const state=kind==='sensor'?a:kind==='flash'?f:null;
  const version=state?.version||0;
- return {connected,kind,version,state,busy:!!linking||connecting||!!epdOperationBusy||!!state?.busy||applying,
+ return {connected,kind,version,state,busy:!!linking||connecting||!!epdOperationBusy||!!state?.busy||!!faceSwitch?.blocks,
   ready:!!state?.valid&&(kind!=='flash'||version<105||state.extraReady),name:connected?(bleDevice?.name||'Đồng hồ E-Ink'):'Chưa chọn thiết bị',
   faces:kind==='sensor'?sensor.filter(f=>version>=f[4]&&(version<55||f[0]!=='clock2')).map(f=>version>=55&&f[0]==='clock3'?[f[0],'Giờ lớn',...f.slice(2)]:f):kind==='flash'?flash.filter(f=>version>=f[4]):kind==='legacy'?legacy:sensor.filter(f=>f[0]!=='clock2').map(f=>f[0]==='clock3'?[f[0],'Giờ lớn',...f.slice(2)]:f)};
 }
@@ -2358,7 +2365,7 @@ function renderFaces(s){
   card.append(preview,check,node('span','face-name',f[1]),node('span','face-detail',f[2]));
   if(f[0]==='clock6'||f[0]==='clock7')card.append(node('span','face-tag','Có lời nhắn'));
   if(f[0]==='f7'||f[0]==='f9')card.append(node('span','face-tag',s.version>=105?'Thay ảnh nền':'Tranh mặc định'));
-  card.onclick=()=>{selected=f[0];$('library-notice').textContent='';refresh();};grid.append(card);
+  card.onclick=()=>{selected=f[0];clearFaceSwitch();refresh();};grid.append(card);
  }
  $('library-count').textContent=s.faces.length+' bố cục';
 }
@@ -2367,7 +2374,8 @@ function sourceButton(s,f){
  const index=f[0]==='clock'?0:f[0]==='clock2'?1:2;return document.querySelectorAll('[data-legacy-face]')[index];
 }
 function refresh(){if(!initialized)return;const s=snapshot(),key=s.kind+':'+s.version+':'+s.name;
- if(key!==profileKey){profileKey=key;selected=null;renderKey='';$('library-notice').textContent='';
+ if(faceSwitch&&(!s.connected||gattServer!==faceSwitch.server))finishFaceSwitch(faceSwitch,'Đã mất kết nối khi chuyển mặt. Hãy kết nối lại và thử nếu cần.','error');
+ if(key!==profileKey){profileKey=key;selected=null;renderKey='';if(s.connected)clearFaceSwitch();
   // A crop from a prior device/background must not carry over into a new 4.2 session.
   if(s.kind==='sensor'||s.kind==='flash'){
    $('imageTarget').value='full';$('screensize').value='400*300';$('ssd').checked=true;
@@ -2404,20 +2412,58 @@ function refresh(){if(!initialized)return;const s=snapshot(),key=s.kind+':'+s.ve
  $('library-selection').textContent=chosen?chosen[1]:'Chọn một mặt ở trên';
  $('library-selection-help').textContent=!s.connected?'Ảnh chỉ để xem trước. Kết nối thiết bị để sử dụng.':s.busy?'Đang chờ thiết bị xử lý. Không chuyển mặt hoặc tải ảnh lúc này.':!chosen?'Chạm vào ảnh để chọn, chưa gửi lệnh tới thiết bị.':!s.ready&&s.kind!=='legacy'?'Cài tài nguyên trong Thiết lập trước khi sử dụng.':'Bấm “Áp dụng” để gửi yêu cầu chuyển mặt.';
  $('library-apply').disabled=!s.connected||s.busy||!chosen||(s.kind!=='legacy'&&!s.ready)||!!source?.disabled;
- $('library-technical').textContent='Web V51 · '+(s.connected?(s.kind==='sensor'?'AHT30 V'+s.version:s.kind==='flash'?'Flash 4.2 · giao thức '+s.version:'Giao thức tương thích cũ'):'Chưa nhận diện firmware')+' · Không tự kết nối lại';
+ $('library-apply').textContent=faceSwitch?.blocks?'Đang chuyển…':'Áp dụng';
+ $('library-technical').textContent='Web V52 · '+(s.connected?(s.kind==='sensor'?'AHT30 V'+s.version:s.kind==='flash'?'Flash 4.2 · giao thức '+s.version:'Giao thức tương thích cũ'):'Chưa nhận diện firmware')+' · Không tự kết nối lại';
 }
 function schedule(){if(scheduled)return;scheduled=true;queueMicrotask(()=>{scheduled=false;refresh();});}
-async function apply(){const s=snapshot(),f=s.faces.find(f=>f[0]===selected);if($('library-apply').disabled||!f)return;
- const sessionName=s.name;applying=true;refresh();$('library-notice').textContent='Đang gửi yêu cầu mở '+f[1]+'…';
- try{let result;
-  if(s.kind==='flash')result=await sourceButton(s,f).onclick();
-  else result=await window.doModeWithTime(f[0]);
-  const now=snapshot();if(!now.connected||now.name!==sessionName)throw Error('Đã mất kết nối khi chuyển mặt.');
-  const flashError=s.kind==='flash'&&$('flash420-status').textContent.startsWith('Chưa hoàn tất:');
-  if(result===false||flashError)throw Error(flashError?$('flash420-status').textContent:'Chưa gửi được lệnh. Xem nhật ký trong Thiết lập.');
-  $('library-notice').textContent='Đã gửi yêu cầu: '+f[1]+'. Chờ màn hình hoàn tất làm mới.';
- }catch(e){$('library-notice').textContent=e.message;}
- finally{applying=false;refresh();}
+function paintFaceSwitch(state,message){
+ $('library-face-progress').hidden=state!=='active';
+ $('library-notice').dataset.state=state;
+ $('library-notice').textContent=message;
+}
+function clearFaceSwitch(){
+ if(faceSwitch)clearTimeout(faceSwitch.timer);
+ faceSwitch=null;paintFaceSwitch('idle','');
+}
+function finishFaceSwitch(job,message,state){
+ if(faceSwitch!==job)return;
+ clearTimeout(job.timer);faceSwitch=null;paintFaceSwitch(state,message);
+}
+function onFaceDraw(server){
+ const job=faceSwitch;
+ if(job?.flash&&job.server===server&&server?.connected)
+  paintFaceSwitch('active','Thiết bị đã nhận lệnh. Đang chờ màn e-ink mở: '+job.name+'…');
+}
+async function apply(){
+ const s=snapshot(),f=s.faces.find(f=>f[0]===selected);
+ if(s.busy||$('library-apply').disabled||!f)return;
+ clearFaceSwitch();
+ const job={server:gattServer,name:f[1],flash:s.kind==='flash',blocks:true,timer:null};
+ faceSwitch=job;
+ paintFaceSwitch('active','Đang gửi yêu cầu mở: '+job.name+'…');
+ refresh();
+ requestAnimationFrame(()=>{
+  if(faceSwitch===job&&activeTab==='faces')$('library-notice').scrollIntoView({block:'nearest'});
+ });
+ try{
+  const result=job.flash?await sourceButton(s,f).onclick():await window.doModeWithTime(f[0]);
+  if(faceSwitch!==job)return;
+  if(gattServer!==job.server||!job.server?.connected)throw Error('Đã mất kết nối khi chuyển mặt.');
+  if(result!==true){
+   const detail=job.flash?$('flash420-status').textContent:'';
+   throw Error(detail.startsWith('Chưa hoàn tất:')?detail:'Chưa gửi được lệnh. Xem nhật ký trong Thiết lập.');
+  }
+  if(job.flash){
+   finishFaceSwitch(job,'Đã chuyển xong: '+job.name+'.','done');
+  }else{
+   // These firmwares acknowledge the Bluetooth write, not refresh completion.
+   // Keep an activity hint for a bounded time without blocking another selection.
+   job.blocks=false;
+   paintFaceSwitch('active','Đã gửi lệnh mở '+job.name+'. Hãy chờ màn e-ink làm mới…');
+   job.timer=setTimeout(()=>finishFaceSwitch(job,'Đã gửi lệnh mở '+job.name+'. Hãy kiểm tra kết quả trên mặt đồng hồ.','sent'),NO_DRAW_STATUS_WAIT_MS);
+  }
+ }catch(e){finishFaceSwitch(job,e?.message||'Chưa chuyển được mặt đồng hồ.','error');}
+ finally{refresh();}
 }
 function init(){if(initialized)return;const root=document.querySelector('.container'),backend=$('etagFn');if(!root||!backend)return;
  const head=node('header','library-head');head.innerHTML='<div class="brand"><span class="brand-mark" aria-hidden="true">◷</span><div><h1>Đồng hồ E-Ink</h1><p>Chọn mặt · thêm ảnh · viết lời nhắn</p></div></div>';
@@ -2438,6 +2484,7 @@ function init(){if(initialized)return;const root=document.querySelector('.contai
  const legacyNote=node('p','library-help','Thiết bị này dùng giao thức cũ. Bạn có thể tiếp tục dùng trang web cũ; tên Đồng hồ 1 / 2 được giữ nguyên.');legacyNote.id='library-legacy-note';legacyNote.hidden=true;faces.append(legacyNote);
  const grid=node('div','library-grid');grid.id='library-grid';grid.setAttribute('aria-label','Thư viện bố cục');faces.append(grid);
  const bar=node('div','apply-bar');bar.innerHTML='<div><strong id="library-selection">Chọn một mặt ở trên</strong><p id="library-selection-help">Chạm vào ảnh để chọn, chưa gửi lệnh.</p></div><button id="library-apply" type="button" disabled>Áp dụng</button>';faces.append(bar);
+ const progress=node('div','face-switch-track');progress.id='library-face-progress';progress.hidden=true;progress.setAttribute('role','progressbar');progress.setAttribute('aria-label','Đang chuyển mặt đồng hồ');faces.append(progress);
  const notice=node('div','library-notice');notice.id='library-notice';notice.setAttribute('role','status');notice.setAttribute('aria-live','polite');faces.append(notice);
  const fine=node('p','subtle','Ảnh minh họa từ firmware; dữ liệu ngày, giờ và cảm biến sẽ theo thiết bị của bạn.');fine.style.marginTop='12px';faces.append(fine);
  panels.images.append(heading('Ảnh & hình nền','Chọn ảnh, cắt và căn chỉnh trước khi tải lên đồng hồ.'));
@@ -2475,7 +2522,7 @@ function init(){if(initialized)return;const root=document.querySelector('.contai
  $('fujiGallery').querySelector('strong').textContent='Tranh mẫu cho mặt Tranh phong cảnh';
  initialized=true;showTab('faces');refresh();
 }
-window.EpdLibrary={schedule,refresh};
+window.EpdLibrary={schedule,refresh,onFaceDraw};
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init,{once:true});else init();
 })();
 
