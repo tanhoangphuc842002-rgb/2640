@@ -16,13 +16,23 @@ const { pathToFileURL } = require('node:url');
     async function setup(kind) {
       await page.goto(pathToFileURL(path.join(__dirname, 'index.html')).href);
       await page.evaluate(async kind => {
-        let response, release, mode = 1, status = 0, writes = 0;
+        let response, release, mode = 1, status = 0, writes = 0, requested;
         const server = { connected: true };
         const characteristic = {
           writeValueWithResponse: async data => {
             const a = Array.from(data), [family, group, op, seq] = a;
+            if (family === 0xa8 && group === 0x48 && op === 0) {
+              const b = new Uint8Array(18);
+              b.set([family,group,op,seq,0,kind==='sensor56'?56:55,1,1]);
+              const v = new DataView(b.buffer);
+              v.setUint32(11,AHT55Bundle.crc,true);
+              v.setUint16(15,AHT55Bundle.size,true);
+              response = v;
+              return;
+            }
             if (family === 16 || (family === 0xe9 && op === 1)) {
               writes++;
+              requested=family===16?a[9]:a[8];
               await new Promise(r => { release = r; });
               if (family === 16) return;
               mode = a[8];
@@ -52,7 +62,7 @@ const { pathToFileURL } = require('node:url');
         epdService = { getCharacteristic: async () => characteristic };
         bleDevice = { name: 'C26_TEST' };
         if (kind === 'flash' && !await Flash420.attach(epdService, server)) throw Error('Flash not attached');
-        if (kind === 'sensor') AHT48.uiState = () => ({ active: true, version: 55, valid: true });
+        if (kind.startsWith('sensor') && !await AHT48.attach(epdService,server)) throw Error('AHT30 not attached');
         etagFnEnable(true);
         EpdLibrary.refresh();
         window.releaseMode = () => release?.();
@@ -60,9 +70,12 @@ const { pathToFileURL } = require('node:url');
         window.endDraw = error => { status = error ? 2 : 0; };
         window.cutLink = () => { server.connected = false; disconnect(); };
         window.modeWrites = () => writes;
+        window.requestedMode = () => requested;
       }, kind);
-      const face = kind === 'flash' ? 'f2' : kind === 'sensor' ? 'clock6' : 'clock';
+      const face = kind === 'flash' ? 'f2' : kind === 'sensor56' ? 'clock9' : kind === 'sensor' ? 'clock6' : 'clock';
+      if(kind==='sensor')assert.equal(await page.locator('[data-face="clock9"]').count(),0);
       await page.locator('#library-grid [data-face="' + face + '"]').click();
+      if(kind==='sensor56')await page.waitForFunction(()=>document.querySelector('[data-face="clock9"] img')?.naturalWidth===400);
       await apply.click();
       await page.waitForFunction(() => window.modeReady());
       assert(await progress.isVisible());
@@ -70,9 +83,10 @@ const { pathToFileURL } = require('node:url');
       assert.equal(await apply.isDisabled(), true);
       assert.match(await notice.textContent(), /Đang gửi yêu cầu/);
       assert.equal(await page.evaluate(() => window.modeWrites()), 1);
+      if(kind==='sensor56')assert.equal(await page.evaluate(() => window.requestedMode()), 10);
     }
 
-    for (const kind of ['legacy', 'sensor']) {
+    for (const kind of ['legacy', 'sensor', 'sensor56']) {
       await setup(kind);
       await page.evaluate(() => window.releaseMode());
       await page.waitForFunction(() => document.getElementById('library-notice').textContent.includes('Hãy chờ'));
