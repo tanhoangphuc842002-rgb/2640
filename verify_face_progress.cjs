@@ -16,6 +16,7 @@ const { pathToFileURL } = require('node:url');
     async function setup(kind) {
       await page.goto(pathToFileURL(path.join(__dirname, 'index.html')).href);
       await page.evaluate(async kind => {
+        window.expectedExtra110CRC=1275495557;
         let response, release, mode = 1, status = 0, writes = 0, requested;
         const server = { connected: true };
         const characteristic = {
@@ -42,7 +43,7 @@ const { pathToFileURL } = require('node:url');
             const length = family === 0xe9 && op === 0 ? 9 : op === 3 ? 7 : op === 35 ? 14 : op === 0 ? 20 : 6;
             const b = new Uint8Array(length);
             b.set([family, group, op, seq, 0]);
-            if (family === 0xe9 && op === 0) b.set([109, 4, 0x26, 2], 5);
+            if (family === 0xe9 && op === 0) b.set([kind==='flash110'?110:109, 4, 0x26, 2], 5);
             if (family === 0xe9 && op === 3) b.set([status, mode], 5);
             const v = new DataView(b.buffer);
             if (family === 0xe8 && op === 0) {
@@ -51,8 +52,8 @@ const { pathToFileURL } = require('node:url');
               v.setUint32(12, Font420Bundle.crc32, true);
             }
             if (op === 35) {
-              v.setUint32(6, Font420Features.bold109.auxLength, true);
-              v.setUint32(10, Font420Features.bold109.auxCrc, true);
+              v.setUint32(6, kind==='flash110'?2603:Font420Features.bold109.auxLength, true);
+              v.setUint32(10, kind==='flash110'?window.expectedExtra110CRC:Font420Features.bold109.auxCrc, true);
             }
             response = v;
           },
@@ -61,7 +62,7 @@ const { pathToFileURL } = require('node:url');
         gattServer = server;
         epdService = { getCharacteristic: async () => characteristic };
         bleDevice = { name: 'C26_TEST' };
-        if (kind === 'flash' && !await Flash420.attach(epdService, server)) throw Error('Flash not attached');
+        if (kind.startsWith('flash') && !await Flash420.attach(epdService, server)) throw Error('Flash not attached');
         if (kind.startsWith('sensor') && !await AHT48.attach(epdService,server)) throw Error('AHT30 not attached');
         etagFnEnable(true);
         EpdLibrary.refresh();
@@ -72,7 +73,8 @@ const { pathToFileURL } = require('node:url');
         window.modeWrites = () => writes;
         window.requestedMode = () => requested;
       }, kind);
-      const face = kind === 'flash' ? 'f2' : kind === 'sensor56' ? 'clock9' : kind === 'sensor' ? 'clock6' : 'clock';
+      const face = kind === 'flash110' ? 'f12' : kind === 'flash' ? 'f2' : kind === 'sensor56' ? 'clock9' : kind === 'sensor' ? 'clock6' : 'clock';
+      if(kind==='flash')assert.equal(await page.locator('[data-face="f12"]').count(),0);
       if(kind==='sensor')assert.equal(await page.locator('[data-face="clock9"]').count(),0);
       await page.locator('#library-grid [data-face="' + face + '"]').click();
       if(kind==='sensor56')await page.waitForFunction(()=>document.querySelector('[data-face="clock9"] img')?.naturalWidth===400);
@@ -84,6 +86,7 @@ const { pathToFileURL } = require('node:url');
       assert.match(await notice.textContent(), /Đang gửi yêu cầu/);
       assert.equal(await page.evaluate(() => window.modeWrites()), 1);
       if(kind==='sensor56')assert.equal(await page.evaluate(() => window.requestedMode()), 10);
+      if(kind==='flash110')assert.equal(await page.evaluate(() => window.requestedMode()), 12);
     }
 
     for (const kind of ['legacy', 'sensor', 'sensor56']) {
@@ -100,7 +103,7 @@ const { pathToFileURL } = require('node:url');
     }
 
     for (const error of [false, true]) {
-      await setup('flash');
+      await setup('flash110');
       await page.evaluate(() => window.releaseMode());
       await page.waitForFunction(() => document.getElementById('library-notice').textContent.includes('Thiết bị đã nhận lệnh'));
       assert(await progress.isVisible());
